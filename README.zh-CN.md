@@ -109,7 +109,7 @@ cargo build --release  # 发布构建
 | 类别 | 单位 |
 | --- | --- |
 | 长度 | mm · cm · m · km · in · ft · yd · mi |
-| 面积 | cm² · m² · km² · 公顷 · 英亩 · in² · ft² |
+| 面积 | cm² · m² · km² · ha · acre · in² · ft² |
 | 体积 | ml · L · m³ · gal · fl oz · ft³ |
 | 重量 | g · kg · t · lb · oz |
 | 速度 | m/s · km/h · mph · kn · ft/s |

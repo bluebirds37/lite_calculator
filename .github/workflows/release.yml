@@ -53,11 +53,10 @@ jobs:
         shell: pwsh
         run: |
           cargo build --release
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target\release\calculator.exe dist\
-          Copy-Item README.md,README.zh-CN.md,LICENSE dist\
-          Compress-Archive -Path dist\calculator.exe,dist\README.md,dist\README.zh-CN.md,dist\LICENSE `
-            -DestinationPath "dist\LiteCalculator-v${env:APP_VERSION}-windows-x64.zip"
+          # 便携包的暂存目录与 dist/ 分开，dist/ 只放最终产物，避免文档被当作 release 资源上传。
+          New-Item -ItemType Directory -Force -Path stage, dist | Out-Null
+          Copy-Item target\release\calculator.exe,README.md,README.zh-CN.md,LICENSE stage\
+          Compress-Archive -Path stage\* -DestinationPath "dist\LiteCalculator-v${env:APP_VERSION}-windows-x64.zip"
 
       - name: Build Windows installer
         if: runner.os == 'Windows'
@@ -73,7 +72,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}-assets
-          path: dist/*
+          # 只上传压缩包与安装程序；LiteCalculator.app 是目录，gh release upload 无法处理。
+          path: |
+            dist/*.zip
+            dist/*.exe
           if-no-files-found: error
 
   publish:
@@ -101,7 +103,7 @@ jobs:
           tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
           case "$tag" in v*) ;; *) echo "标签必须以 v 开头：$tag" >&2; exit 1 ;; esac
           shopt -s nullglob
-          files=(assets/*)
+          files=(assets/*.zip assets/*.exe)
           if [ ${#files[@]} -eq 0 ]; then
             echo "没有构建产物，终止发布" >&2
             exit 1
