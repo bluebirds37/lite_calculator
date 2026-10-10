@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的版本标签，例如 v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        shell: bash
+        run: echo "APP_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" >>"$GITHUB_ENV"
+
+      - name: Test
+        shell: bash
+        # Windows 上无头 UI 测试依赖本机窗口后端，这里只跑引擎与换算的纯逻辑测试。
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo test --bin calculator -- engine::tests convert::tests
+          else
+            cargo test
+          fi
+
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: ./scripts/build-app.sh
+
+      - name: Package Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\calculator.exe dist\
+          Copy-Item README.md,README.zh-CN.md,LICENSE dist\
+          Compress-Archive -Path dist\calculator.exe,dist\README.md,dist\README.zh-CN.md,dist\LICENSE `
+            -DestinationPath "dist\LiteCalculator-v${env:APP_VERSION}-windows-x64.zip"
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = @("C:\Program Files (x86)\Inno Setup 6\iscc.exe", "C:\Program Files\Inno Setup 6\iscc.exe") |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "Inno Setup compiler not found" }
+          & $iscc "/DAppVersion=$env:APP_VERSION" packaging\installer.nsi
+          Get-ChildItem dist | Format-Table Name,Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-assets
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Attach assets to the release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      INPUT_TAG: ${{ github.event.inputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-assets"
+          merge-multiple: true
+          path: assets
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          case "$tag" in v*) ;; *) echo "标签必须以 v 开头：$tag" >&2; exit 1 ;; esac
+          shopt -s nullglob
+          files=(assets/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "没有构建产物，终止发布" >&2
+            exit 1
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" "${files[@]}" --title "Lite Calculator $tag" --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY"

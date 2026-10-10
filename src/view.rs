@@ -7,6 +7,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 
+use crate::convert::{
+    Base, Conversion, ConvertKey, ConvertKind, Converter, BASES, CATEGORIES, KINDS,
+};
 use crate::engine::{Calculator, Key, Mode};
 
 /// 按键的视觉层级。
@@ -90,6 +93,37 @@ const SCIENTIFIC_PAD: [&[Spec]; 4] = [
     ],
 ];
 
+/// 转换面板的键盘：7 列 × 3 行，字母键只在十六进制下可用。
+const CONVERT_PAD: [[(&str, &str, ConvertKey); 7]; 3] = [
+    [
+        ("c-1", "1", ConvertKey::Digit('1')),
+        ("c-2", "2", ConvertKey::Digit('2')),
+        ("c-3", "3", ConvertKey::Digit('3')),
+        ("c-4", "4", ConvertKey::Digit('4')),
+        ("c-5", "5", ConvertKey::Digit('5')),
+        ("c-6", "6", ConvertKey::Digit('6')),
+        ("c-7", "7", ConvertKey::Digit('7')),
+    ],
+    [
+        ("c-8", "8", ConvertKey::Digit('8')),
+        ("c-9", "9", ConvertKey::Digit('9')),
+        ("c-0", "0", ConvertKey::Digit('0')),
+        ("c-a", "A", ConvertKey::Digit('a')),
+        ("c-b", "B", ConvertKey::Digit('b')),
+        ("c-c", "C", ConvertKey::Digit('c')),
+        ("c-d", "D", ConvertKey::Digit('d')),
+    ],
+    [
+        ("c-e", "E", ConvertKey::Digit('e')),
+        ("c-f", "F", ConvertKey::Digit('f')),
+        ("c-dot", ".", ConvertKey::Dot),
+        ("c-colon", ":", ConvertKey::Colon),
+        ("c-sign", "−", ConvertKey::Sign),
+        ("c-back", "⌫", ConvertKey::Back),
+        ("c-clear", "AC", ConvertKey::Clear),
+    ],
+];
+
 /// 渲染期使用的调色板，避免在构造元素时继续借用 `App`。
 struct Palette {
     canvas: Hsla,
@@ -102,6 +136,8 @@ struct Palette {
 
 pub struct CalculatorView {
     calc: Calculator,
+    converter: Converter,
+    convert_open: bool,
     focus: FocusHandle,
     focused: bool,
 }
@@ -110,8 +146,23 @@ impl CalculatorView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             calc: Calculator::new(),
+            converter: Converter::new(),
+            convert_open: false,
             focus: cx.focus_handle(),
             focused: false,
+        }
+    }
+
+    /// 把一段状态变更包成点击回调。
+    fn on(
+        view: Entity<Self>,
+        action: impl Fn(&mut Self, &mut Context<Self>) + Clone + 'static,
+    ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+        move |_, _, cx| {
+            view.update(cx, |this, cx| {
+                action(this, cx);
+                cx.notify();
+            });
         }
     }
 
@@ -119,20 +170,17 @@ impl CalculatorView {
         view: Entity<Self>,
         key: Key,
     ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
-        move |_, _, cx| {
-            view.update(cx, |this, cx| {
-                this.calc.press(key);
-                cx.notify();
-            });
-        }
+        Self::on(view, move |this, _| this.calc.press(key))
     }
 
-    fn tile(
-        spec: &Spec,
+    fn pad_tile(
+        id: &'static str,
+        label: &'static str,
+        font: f32,
+        tone: Tone,
         height: f32,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Button {
-        let (id, label, font, tone, _) = *spec;
         let button = Button::new(id)
             .child(
                 div()
@@ -154,6 +202,15 @@ impl CalculatorView {
             Tone::Clear => button.danger(),
             Tone::Function => button.ghost().with_size(Size::Small).rounded(px(11.)),
         }
+    }
+
+    fn tile(
+        spec: &Spec,
+        height: f32,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Button {
+        let (id, label, font, tone, _) = *spec;
+        Self::pad_tile(id, label, font, tone, height, on_click)
     }
 
     fn row(specs: &[Spec], view: &Entity<Self>, height: f32) -> Div {
@@ -291,6 +348,17 @@ impl CalculatorView {
             )
             .child(div().flex_1())
             .child(
+                Button::new("convert")
+                    .label("换算")
+                    .ghost()
+                    .with_size(Size::Small)
+                    .selected(self.convert_open)
+                    .tooltip("打开进制 / 角度 / 单位换算面板")
+                    .on_click(Self::on(view.clone(), |this, _| {
+                        this.convert_open = !this.convert_open;
+                    })),
+            )
+            .child(
                 Button::new("angle")
                     .label(self.calc.angle().label())
                     .outline()
@@ -337,6 +405,292 @@ impl CalculatorView {
         )
     }
 
+    fn convert_chip(
+        id: String,
+        label: &'static str,
+        active: bool,
+        action: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Button {
+        Button::new(id)
+            .label(label)
+            .ghost()
+            .with_size(Size::Small)
+            .selected(active)
+            .rounded(px(10.))
+            .on_click(action)
+    }
+
+    /// 换算按键在当前类别下是否可用：字母只服务十六进制，冒号只服务度分秒。
+    fn convert_key_enabled(key: ConvertKey, kind: ConvertKind, base: Base) -> bool {
+        match key {
+            ConvertKey::Digit(ch) if ch.is_ascii_alphabetic() => {
+                kind == ConvertKind::Base && base == Base::Hex
+            }
+            ConvertKey::Colon => kind == ConvertKind::Angle,
+            ConvertKey::Sign => kind != ConvertKind::Base,
+            _ => true,
+        }
+    }
+
+    fn convert_hint(&self) -> String {
+        match self.converter.kind {
+            ConvertKind::Base => format!("按 {} 输入整数", self.converter.base.label()),
+            ConvertKind::Angle => "十进制度，或 度:分:秒".to_string(),
+            ConvertKind::Unit => {
+                format!("{} → {}", self.converter.from_unit, self.converter.to_unit)
+            }
+        }
+    }
+
+    /// 覆盖在键盘之上的换算面板。
+    fn render_convert(&self, view: &Entity<Self>, palette: &Palette) -> Div {
+        let mut scrim = palette.canvas;
+        scrim.a = 0.82;
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(44.))
+            .bg(scrim)
+            .child(self.convert_card(view, palette))
+    }
+
+    fn convert_card(&self, view: &Entity<Self>, palette: &Palette) -> Div {
+        let kind = self.converter.kind;
+        let base = self.converter.base;
+        let buffer = self.converter.buffer();
+
+        let header = h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(palette.foreground)
+                    .child("换算"),
+            )
+            .child(div().flex_1())
+            .child(Self::convert_chip(
+                "c-close".to_string(),
+                "✕",
+                false,
+                Self::on(view.clone(), |this, _| this.convert_open = false),
+            ));
+
+        let kinds = h_flex()
+            .w_full()
+            .gap_1()
+            .p_1()
+            .rounded(px(12.))
+            .bg(palette.surface)
+            .border_1()
+            .border_color(palette.border)
+            .children(KINDS.iter().map(|entry| {
+                Self::convert_chip(
+                    format!("c-kind-{}", entry.id()),
+                    entry.label(),
+                    kind == *entry,
+                    Self::on(view.clone(), move |this, _| this.converter.set_kind(*entry)),
+                )
+            }));
+
+        let base_row = (kind == ConvertKind::Base).then(|| {
+            h_flex()
+                .w_full()
+                .gap_1()
+                .children(BASES.iter().map(|entry| {
+                    Self::convert_chip(
+                        format!("c-base-{}", entry.id()),
+                        entry.label(),
+                        base == *entry,
+                        Self::on(view.clone(), move |this, _| this.converter.set_base(*entry)),
+                    )
+                }))
+                .into_any_element()
+        });
+
+        let unit_rows = (kind == ConvertKind::Unit).then(|| {
+            let category = self.converter.category;
+            let units = category.units();
+            let from = self.converter.from_unit;
+            let to = self.converter.to_unit;
+
+            let tray = |leading: &'static str, active: &'static str, target: &'static str| {
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .flex_wrap()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(palette.muted)
+                            .child(leading),
+                    )
+                    .children(units.iter().enumerate().map(move |(index, unit)| {
+                        let selected = active == unit.key;
+                        let key = unit.key;
+                        let on_select = move |this: &mut Self, _: &mut Context<Self>| match target {
+                            "from" => this.converter.set_from(key),
+                            _ => this.converter.set_to(key),
+                        };
+                        Self::convert_chip(
+                            format!("c-{target}-{index}"),
+                            unit.label,
+                            selected,
+                            Self::on(view.clone(), on_select),
+                        )
+                    }))
+            };
+
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_1()
+                        .flex_wrap()
+                        .children(CATEGORIES.iter().map(|entry| {
+                            Self::convert_chip(
+                                format!("c-cat-{}", entry.id()),
+                                entry.label(),
+                                category == *entry,
+                                Self::on(view.clone(), move |this, _| {
+                                    this.converter.set_category(*entry)
+                                }),
+                            )
+                        })),
+                )
+                .child(tray("从", from, "from"))
+                .child(tray("到", to, "to"))
+                .into_any_element()
+        });
+
+        let input_line = h_flex()
+            .w_full()
+            .items_end()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.))
+                    .text_color(palette.muted)
+                    .child(self.convert_hint()),
+            )
+            .child(
+                div()
+                    .overflow_hidden()
+                    .text_right()
+                    .text_size(px(24.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(palette.foreground)
+                    .child(if buffer.is_empty() {
+                        "0".to_string()
+                    } else {
+                        buffer.to_string()
+                    }),
+            );
+
+        let results = match self.converter.conversion() {
+            Conversion::Empty => div()
+                .w_full()
+                .text_right()
+                .text_size(px(12.))
+                .text_color(palette.muted)
+                .child("输入数值")
+                .into_any_element(),
+            Conversion::Error(text) => div()
+                .w_full()
+                .text_right()
+                .text_size(px(13.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(palette.danger)
+                .child(text)
+                .into_any_element(),
+            Conversion::Rows(rows) => v_flex()
+                .w_full()
+                .gap_1()
+                .children(rows.iter().map(|(label, value)| {
+                    let font = match value.chars().count() {
+                        0..=18 => 15.,
+                        19..=30 => 13.,
+                        _ => 11.,
+                    };
+                    h_flex()
+                        .w_full()
+                        .items_end()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(palette.muted)
+                                .child(label.clone()),
+                        )
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .text_right()
+                                .text_size(px(font))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(palette.foreground)
+                                .child(value.clone()),
+                        )
+                }))
+                .into_any_element(),
+        };
+
+        let pad = v_flex()
+            .w_full()
+            .gap_2()
+            .children(CONVERT_PAD.iter().map(|row| {
+                h_flex()
+                    .w_full()
+                    .gap_1p5()
+                    .children(row.iter().map(|&(id, label, key)| {
+                        let tone = match key {
+                            ConvertKey::Clear => Tone::Clear,
+                            ConvertKey::Back => Tone::Operator,
+                            _ => Tone::Number,
+                        };
+                        Self::pad_tile(
+                            id,
+                            label,
+                            15.,
+                            tone,
+                            38.,
+                            Self::on(view.clone(), move |this, _| this.converter.press(key)),
+                        )
+                        .disabled(!Self::convert_key_enabled(key, kind, base))
+                    }))
+            }));
+
+        v_flex()
+            .w(px(352.))
+            .gap_2()
+            .p_3()
+            .rounded(px(22.))
+            .bg(palette.canvas)
+            .border_1()
+            .border_color(palette.border)
+            .child(header)
+            .child(kinds)
+            .children(base_row)
+            .children(unit_rows)
+            .child(input_line)
+            .child(results)
+            .child(pad)
+    }
+
     fn keystroke_to_key(stroke: &Keystroke, scientific: bool) -> Option<Key> {
         if stroke.modifiers.control || stroke.modifiers.alt || stroke.modifiers.platform {
             return None;
@@ -378,6 +732,35 @@ impl CalculatorView {
             _ => return None,
         })
     }
+
+    /// 换算面板打开时，物理键盘只驱动换算输入。
+    fn keystroke_to_convert_key(stroke: &Keystroke, converter: &Converter) -> Option<ConvertKey> {
+        if stroke.modifiers.control || stroke.modifiers.alt || stroke.modifiers.platform {
+            return None;
+        }
+        match stroke.key.as_str() {
+            "backspace" => return Some(ConvertKey::Back),
+            "delete" => return Some(ConvertKey::Clear),
+            _ => {}
+        }
+        let mut chars = stroke.key_char.as_deref()?.chars();
+        let (Some(first), None) = (chars.next(), chars.next()) else {
+            return None;
+        };
+        if first.is_ascii_digit() {
+            return Some(ConvertKey::Digit(first));
+        }
+        let lower = first.to_ascii_lowercase();
+        Some(match lower {
+            '.' => ConvertKey::Dot,
+            ':' => ConvertKey::Colon,
+            '-' => ConvertKey::Sign,
+            'a'..='f' if converter.kind == ConvertKind::Base && converter.base == Base::Hex => {
+                ConvertKey::Digit(lower)
+            }
+            _ => return None,
+        })
+    }
 }
 
 impl Render for CalculatorView {
@@ -402,8 +785,20 @@ impl Render for CalculatorView {
         v_flex()
             .id("calculator")
             .size_full()
+            .relative()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.convert_open {
+                    if event.keystroke.key == "escape" {
+                        this.convert_open = false;
+                    } else if let Some(key) =
+                        Self::keystroke_to_convert_key(&event.keystroke, &this.converter)
+                    {
+                        this.converter.press(key);
+                    }
+                    cx.notify();
+                    return;
+                }
                 let scientific = this.calc.mode() == Mode::Scientific;
                 if let Some(key) = Self::keystroke_to_key(&event.keystroke, scientific) {
                     this.calc.press(key);
@@ -463,6 +858,10 @@ impl Render for CalculatorView {
                     .child(self.render_display(&palette))
                     .child(self.render_mode_bar(&view, &palette))
                     .child(self.render_keypad(&view, &palette)),
+            )
+            .children(
+                self.convert_open
+                    .then(|| self.render_convert(&view, &palette).into_any_element()),
             )
     }
 }
@@ -581,5 +980,115 @@ mod tests {
 
         let (_, result, _) = snapshot(&view, cx);
         assert_eq!(result.as_deref(), Some("0.841470984808"));
+    }
+
+    /// 打开换算面板所需的点击次数很少，这里统一读回面板状态与结果。
+    fn convert_state(
+        view: &Entity<CalculatorView>,
+        cx: &mut TestAppContext,
+        label: &str,
+    ) -> (bool, Option<String>) {
+        cx.update(|cx| {
+            let view = view.read(cx);
+            (
+                view.convert_open,
+                view.converter.conversion().get(label).map(str::to_string),
+            )
+        })
+    }
+
+    #[gpui_kit::test]
+    fn the_convert_overlay_turns_hex_into_every_radix(cx: &mut TestAppContext) {
+        let (window, view) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("convert", cx);
+            window.render_frame(cx);
+            window.click("c-base-hex", cx);
+            window.render_frame(cx);
+            for id in ["c-7", "c-f"] {
+                window.click(id, cx);
+            }
+        })
+        .unwrap();
+
+        let expr = cx.update(|cx| view.read(cx).calc.expr().to_string());
+        assert_eq!(expr, "", "换算面板的输入不应写回表达式");
+        let (open, decimal) = convert_state(&view, cx, "十进制");
+        assert!(open);
+        assert_eq!(decimal.as_deref(), Some("127"));
+        assert_eq!(
+            convert_state(&view, cx, "二进制").1.as_deref(),
+            Some("1111111")
+        );
+        assert_eq!(convert_state(&view, cx, "位宽").1.as_deref(), Some("7 bit"));
+    }
+
+    #[gpui_kit::test]
+    fn the_convert_overlay_changes_units(cx: &mut TestAppContext) {
+        let (window, view) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("convert", cx);
+            window.click("c-kind-unit", cx);
+            window.render_frame(cx);
+            for id in ["c-1", "c-0", "c-0"] {
+                window.click(id, cx);
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            convert_state(&view, cx, "换算结果").1.as_deref(),
+            Some("62.1371192237 mi"),
+            "默认长度换算 km → mi"
+        );
+
+        cx.update_window(window, |_, window, cx| {
+            window.click("c-from-7", cx);
+            window.click("c-to-3", cx);
+        })
+        .unwrap();
+        assert_eq!(
+            convert_state(&view, cx, "换算结果").1.as_deref(),
+            Some("160.9344 km"),
+            "换成 mi → km 后结果同步"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_convert_overlay_takes_physical_keys_and_closes_on_escape(cx: &mut TestAppContext) {
+        let (window, view) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("convert", cx);
+            window.click("c-kind-angle", cx);
+            window.render_frame(cx);
+            for key in ["4", "0", ":", "2", "6", ":", "4", "6"] {
+                window.press(key, cx);
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            convert_state(&view, cx, "十进制度").1.as_deref(),
+            Some("40.4461111111"),
+            "度分秒输入应转成十进制度"
+        );
+        assert_eq!(
+            convert_state(&view, cx, "度分秒").1.as_deref(),
+            Some("40° 26′ 46″")
+        );
+        assert_eq!(
+            cx.update(|cx| view.read(cx).calc.expr().to_string()),
+            "",
+            "面板内的按键不落入表达式"
+        );
+
+        cx.update_window(window, |_, window, cx| {
+            window.press("escape", cx);
+        })
+        .unwrap();
+        assert!(!convert_state(&view, cx, "十进制度").0, "Esc 关闭面板");
     }
 }

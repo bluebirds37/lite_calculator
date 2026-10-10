@@ -1,6 +1,9 @@
 // gpui_kit::test 宏展开层次较深。
 #![recursion_limit = "256"]
+// Windows 的 release 构建不弹出控制台窗口，debug 仍保留以便看日志。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod convert;
 mod engine;
 mod view;
 
